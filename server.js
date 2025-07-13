@@ -1,90 +1,144 @@
 // server.js
 
 // 1. 필요한 모듈 임포트
-const express = require('express'); // 웹 서버 프레임워크
-const dotenv = require('dotenv');   // 환경 변수 로드
-const { Pool } = require('pg');     // PostgreSQL 클라이언트
+const express = require('express');             // 웹 서버 프레임워크
+const dotenv = require('dotenv');               // 환경 변수 로드
+const { Pool } = require('pg');                 // PostgreSQL 클라이언트
+const axios = require('axios');                 // HTTP 요청
+const qs = require('qs');                       // 쿼리스트링 변환
+const jwt = require('jsonwebtoken');            // JWT 생성/검증
+const session = require('express-session');     // 세션 관리
+const cors = require('cors');                   // CORS 설정
 
 // 2. 환경 변수 로드 (.env 파일에서)
 dotenv.config();
 
 // 3. Express 애플리케이션 초기화
-const app = express();
-const port = process.env.PORT || 3000; // 환경 변수에 PORT가 없으면 3000번 포트 사용
+const app = express(); 
+const port = process.env.PORT || 3000;
 
 // 4. 미들웨어 설정
-app.use(express.json()); // JSON 형식의 요청 본문(body)을 파싱하기 위함
+app.use(express.json());                       // JSON 바디 파싱
+app.use(express.urlencoded({ extended: true }));
+app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'session_secret',
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: process.env.NODE_ENV === 'production', httpOnly: true }
+}));
 
 // 5. PostgreSQL 데이터베이스 연결 설정
-// 환경 변수에서 DB 연결 정보 가져오기
 const pool = new Pool({
-  user: process.env.DB_USER,        // .env 파일의 DB_USER (예: sk)
-  host: process.env.DB_HOST,        // .env 파일의 DB_HOST (Docker Compose 사용 시 'facer', 직접 실행 시 'localhost')
-  database: process.env.DB_NAME,    // .env 파일의 DB_NAME (예: facer_db)
-  password: process.env.DB_PASSWORD,// .env 파일의 DB_PASSWORD (예: madcamp@2025)
-  port: process.env.DB_PORT,        // .env 파일의 DB_PORT (기본 5432)
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT || 5432,
 });
 
-// 데이터베이스 연결 테스트 함수
-async function testDbConnection() {
+// JWT 토큰 생성 함수
+function generateJwtToken(userId, googleId, nickname) {
+  const payload = { id: userId, googleId, nickname };
+  return jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '24h' });
+}
+
+// 사용자 조회 또는 생성 함수
+async function findOrCreateUser(googleId, nickname, email, picture) {
+  const client = await pool.connect();
   try {
-    const client = await pool.connect(); // DB 연결 시도
-    console.log('✅ Database connected successfully!');
-
-    // pgvector 확장 활성화 확인 (선택 사항: 이미 Docker exec로 활성화했다면 필요 없음)
-    const res = await client.query('SELECT 1 FROM pg_extension WHERE extname = \'vector\';');
-    if (res.rows.length > 0) {
-      console.log('✅ pgvector extension is active.');
+    const res = await client.query('SELECT * FROM users WHERE google_id = $1', [googleId]);
+    if (res.rows.length) {
+      await client.query(
+        'UPDATE users SET nickname=$1, email=$2, profile_image_url=$3, updated_at=NOW() WHERE google_id=$4',
+        [nickname, email, picture, googleId]
+      );
+      return res.rows[0];
     } else {
-      console.warn('⚠️ pgvector extension is NOT active. Please run CREATE EXTENSION IF NOT EXISTS vector;');
+      const ins = await client.query(
+        'INSERT INTO users (google_id, nickname, email, profile_image_url, is_online) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [googleId, nickname, email, picture, true]
+      );
+      return ins.rows[0];
     }
-
-    client.release(); // 사용한 클라이언트를 풀에 반환
-  } catch (err) {
-    console.error('❌ Database connection error:', err.stack);
+  } finally {
+    client.release();
   }
 }
 
-// 6. API 엔드포인트 정의
-
-// 기본 라우트 (루트 경로)
-app.get('/', (req, res) => {
-  res.status(200).send('Welcome to the Facer Node.js Backend!');
-});
-
-// 테스트 API 엔드포인트
-app.get('/api/test', (req, res) => {
-  res.status(200).json({
-    message: 'Hello from Node.js Backend on VM!',
-    status: 'ok',
-    timestamp: new Date().toISOString()
+// 인증 미들웨어
+function authenticateToken(req, res, next) {
+  const auth = req.headers['authorization'];
+  const token = auth && auth.split(' ')[1];
+  if (!token) return res.status(401).json({ message: '토큰이 없습니다.' });
+  jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
+    if (err) return res.status(403).json({ message: '유효하지 않은 토큰입니다.' });
+    req.user = { id: payload.id, nickname: payload.nickname };
+    next();
   });
-});
+}
 
-// 데이터베이스 연결 테스트 API (DB 연결이 잘 되었는지 확인)
-app.get('/api/db-test', async (req, res) => {
+// --- Google OAuth 로그인 처리 ---
+const GOOGLE_TOKEN_URI = 'https://oauth2.googleapis.com/token';
+
+app.post('/auth/google/login', async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ message: '인가 코드가 필요합니다.' });
   try {
-    const client = await pool.connect();
-    const result = await client.query('SELECT NOW() as current_time');
-    client.release();
-    res.status(200).json({
-      message: 'Database connection successful!',
-      currentTime: result.rows[0].current_time
-    });
-  } catch (error) {
-    console.error('Error connecting to database via API:', error);
-    res.status(500).json({
-      message: 'Failed to connect to database.',
-      error: error.message
-    });
+    // 1) 구글 토큰 교환
+    const tokenRes = await axios.post(
+      GOOGLE_TOKEN_URI,
+      qs.stringify({
+        code,
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        redirect_uri: process.env.GOOGLE_REDIRECT_URI,
+        grant_type: 'authorization_code',
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const { id_token } = tokenRes.data;
+
+    // 2) ID 토큰 디코딩
+    const decoded = jwt.decode(id_token);
+    const googleId = decoded.sub;
+    const nickname = decoded.name;
+    const email = decoded.email;
+    const picture = decoded.picture;
+
+    // 3) 사용자 저장 또는 업데이트
+    const user = await findOrCreateUser(googleId, nickname, email, picture);
+
+    // 4) JWT 발급
+    const appToken = generateJwtToken(user.user_id, googleId, nickname);
+    res.json({ token: appToken, user });
+  } catch (err) {
+    console.error('구글 로그인 오류:', err.response?.data || err.message);
+    res.status(500).json({ message: '구글 로그인 처리 중 오류가 발생했습니다.' });
   }
 });
 
-app.listen(port, '0.0.0.0', () => {
-  console.log(`🚀 Node.js app listening on port ${port} on all interfaces (0.0.0.0)`);
-  console.log(`Access it at http://localhost:${port} (if running locally)`);
-  console.log(`Or via VM IP: http://[YOUR_VM_IP_ADDRESS]:${port}`);
+// 예시 보호된 라우트
+app.get('/api/profile', authenticateToken, (req, res) => {
+  res.json({ message: '프로필 정보 접근 허용', user: req.user });
+});
 
-  // 서버 시작 후 DB 연결 테스트 실행
-  testDbConnection();
+// 기존 라우트
+app.get('/', (req, res) => res.send('Welcome to the Facer Backend!'));
+app.get('/api/test', (req, res) => res.json({ message: 'Hello from backend!', status: 'ok' }));
+app.get('/api/db-test', async (req, res) => {
+  try {
+    const client = await pool.connect();
+    const { rows } = await client.query('SELECT NOW() AS now');
+    client.release();
+    res.json({ time: rows[0].now });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// 서버 시작
+app.listen(port, '0.0.0.0', () => {
+  console.log(`🚀 Server listening on port ${port}`);
 });
