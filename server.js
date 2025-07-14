@@ -55,13 +55,13 @@ async function findOrCreateUser(googleId, nickname, email, picture) {
     const res = await client.query('SELECT * FROM users WHERE google_id = $1', [googleId]);
     if (res.rows.length) {
       await client.query(
-        'UPDATE users SET nickname=$1, email=$2, profile_image_url=$3, updated_at=NOW() isonline=true WHERE google_id=$4',
+        'UPDATE users SET nickname=$1, email=$2, profile_image_url=$3, updated_at=NOW() WHERE google_id=$4',
         [nickname, email, picture, googleId]
       );
       return res.rows[0];
     } else {
       const ins = await client.query(
-        'INSERT INTO users (google_id, nickname, email, profile_image_url, is_online) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        'INSERT INTO users (google_id, nickname, email, profile_image_url) VALUES ($1,$2,$3,$4) RETURNING *',
         [googleId, nickname, email, picture, true]
       );
       return ins.rows[0];
