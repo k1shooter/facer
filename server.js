@@ -124,6 +124,103 @@ app.post('/auth/google/login', async (req, res) => {
   }
 });
 
+app.post('/auth/email/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ message: 'email과 password가 모두 필요합니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+
+    // 1) 사용자 조회
+    const userRes = await client.query(
+      `SELECT user_id, email, nickname, password, profile_image_url
+       FROM users
+       WHERE email = $1`,
+      [email]
+    );
+    if (userRes.rows.length === 0) {
+      return res.status(401).json({ message: '이메일 또는 비밀번호가 일치하지 않습니다.' });
+    }
+    const user = userRes.rows[0];
+
+    // 2) 비밀번호 검증 (평문 비교 또는 bcrypt.compare)
+    // const isMatch = await bcrypt.compare(password, user.password);
+    const isMatch = password == user.password;
+    if (!isMatch) {
+      return res.status(401).json({ message: '이메일 또는 비밀번호가 일치하지 않습니다.' });
+    }
+
+    // 3) 앱 JWT 발급
+    const appToken = generateJwtToken(user.user_id, user.email, user.nickname);
+
+    // 4) 온라인 상태 업데이트 (선택)
+    await client.query(
+      `UPDATE users
+         SET is_online = true
+       WHERE user_id = $1`,
+      [user.user_id]
+    );
+
+    // 5) 응답
+    res.json({
+      token: appToken,
+      user: {
+        user_id: user.user_id,
+        email: user.email,
+        nickname: user.nickname,
+        profile_image_url: user.profile_image_url,
+        is_online: true,
+      },
+    });
+  } catch (err) {
+    console.error('EMAIL LOGIN ERROR:', err);
+    res.status(500).json({ message: '로그인 중 오류가 발생했습니다.' });
+  } finally {
+    client?.release();
+  }
+});
+
+//닉네임, 이메일, 비밀번호를 받아서 가입, 디비에 들어감
+app.post('/auth/register', async (req, res) => {
+  const { email, nickname, password } = req.body;
+  if (!email || !nickname || !password) {
+    return res.status(400).json({ message: 'email, nickname, password 모두 필요합니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+
+    // 이미 같은 이메일이 있는지 체크
+    const dup = await client.query(
+      'SELECT 1 FROM users WHERE email = $1',
+      [email]
+    );
+    if (dup.rows.length) {
+      return res.status(409).json({ message: '이미 사용 중인 이메일입니다.' });
+    }
+
+    // 사용자 생성 (password는 평문 저장)
+    const ins = await client.query(
+      `INSERT INTO users
+         (email, nickname, password, is_online)
+       VALUES ($1, $2, $3, true)
+       RETURNING user_id, email, nickname, profile_image_url, created_at`,
+      [email, nickname, password]
+    );
+    const user = ins.rows[0];
+    res.json({ message: '회원가입 완료', user });
+  } catch (err) {
+    console.error('REGISTER ERROR:', err);
+    res.status(500).json({ message: '회원가입 중 오류가 발생했습니다.' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     cb(null, 'uploads/'); // 예: uploads 폴더에 저장
@@ -658,6 +755,36 @@ app.patch('/contests/status', async (req, res) => {
 });
 
 //---------------------------------------------------------------------------------
+//notification 목록
+app.get('/notifications', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  let client;
+
+  try {
+    client = await pool.connect();
+
+    const { rows } = await client.query(
+      `SELECT 
+         notification_id,
+         type,
+         message,
+         is_read,
+         created_at
+       FROM notifications
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [userId]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error('GET /notifications error:', err);
+    res.status(500).json({ error: '알림 목록 조회 중 오류가 발생했습니다.' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 app.post('/notification_add', async (req, res) => {
   const {
     user_id,
@@ -727,6 +854,45 @@ app.post('/friendship_add', async (req, res) => {
     return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
   }
 
+  //친구 요청, 수락
+  app.patch(
+  '/friendship/:friendship_id',
+  authenticateToken,
+  async (req, res) => {
+    const { friendship_id } = req.params;
+    const { status } = req.body; // 'accepted' 또는 'rejected'
+
+    if (!['accepted', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: "status는 'accepted' 또는 'rejected'여야 합니다." });
+    }
+
+    let client;
+    try {
+      client = await pool.connect();
+
+      const result = await client.query(
+        `UPDATE friendships
+           SET status = $1,
+               responded_at = NOW()
+         WHERE friendship_id = $2
+         RETURNING *`,
+        [status, friendship_id]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: '해당 friendship_id를 찾을 수 없습니다.' });
+      }
+
+      res.json(result.rows[0]);
+    } catch (err) {
+      console.error('PATCH /friendship/:friendship_id error:', err);
+      res.status(500).json({ error: '친구 요청 업데이트 중 오류가 발생했습니다.' });
+    } finally {
+      if (client) client.release();
+    }
+  }
+);
+
   let client;
   try {
     client = await pool.connect();
@@ -769,6 +935,115 @@ app.delete('/friendship_delete', async (req, res) => {
     res.json(result.rows[0]);
   } catch (err) {
     res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+app.get('/friends', authenticateToken, async (req, res) => {
+  const me = req.user.id;
+  let client;
+  try {
+    client = await pool.connect();
+
+    // 내 요청(requester) 혹은 내가 받은 요청(receiver) 모두 조회
+    const result = await client.query(
+      `
+      SELECT
+        f.friendship_id,
+        f.requester_user_id,
+        f.receiver_user_id,
+        f.status,
+        f.requested_at,
+        f.responded_at,
+        u.user_id   AS friend_user_id,
+        u.nickname,
+        u.profile_image_url
+      FROM friendships f
+      -- 상대방 정보를 users 테이블에서 join
+      JOIN users u
+        ON ( (f.requester_user_id = $1 AND u.user_id = f.receiver_user_id)
+          OR (f.receiver_user_id = $1 AND u.user_id = f.requester_user_id) )
+      WHERE (f.requester_user_id = $1 OR f.receiver_user_id = $1)
+        AND f.status='accpeted'
+      ORDER BY f.requested_at DESC
+      `,
+      [me]
+    );
+
+    const friends = result.rows.map(row => ({
+      friendshipId:       row.friendship_id,
+      status:             row.status,               // 'pending', 'accepted', 'rejected'
+      direction:          row.requester_user_id === me ? 'outgoing' : 'incoming',
+      requestedAt:        row.requested_at,
+      respondedAt:        row.responded_at,
+      user: {
+        userId:          row.friend_user_id,
+        nickname:        row.nickname,
+        profileImageUrl: row.profile_image_url,
+      }
+    }));
+
+    res.json(friends);
+  } catch (err) {
+    console.error('GET /friends error:', err);
+    res.status(500).json({ error: '친구 목록 조회 중 오류가 발생했습니다.' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+
+// 두 포토 id 를 받아서 유사도를 알려주는 api
+// 친구랑 비교할 때 사용
+// user_photo_id와 friend_photo_id를 사용
+// friend_photo_id 또한 user_photos에 들어가 있음
+app.post('/friend_similarity', authenticateToken, async (req, res) => {
+  const { user_photo_id, friend_photo_id } = req.body;
+
+  if (!user_photo_id || !friend_photo_id) {
+    return res.status(400).json({ error: 'user_photo_id와 friend_photo_id가 필요합니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+
+    // 1) 나(유저) 임베딩 벡터 조회
+    const userQ = await client.query(
+      'SELECT embedding_vector FROM user_photos WHERE user_photo_id = $1',
+      [user_photo_id]
+    );
+    if (userQ.rows.length === 0) {
+      return res.status(404).json({ error: '해당 user_photo_id를 찾을 수 없습니다.' });
+    }
+    const vecUser = userQ.rows[0].embedding_vector;
+
+    // 2) 친구 임베딩 벡터 조회
+    const friendQ = await client.query(
+      'SELECT embedding_vector FROM user_photos WHERE user_photo_id = $1',
+      [friend_photo_id]
+    );
+    if (friendQ.rows.length === 0) {
+      return res.status(404).json({ error: '해당 friend_photo_id를 찾을 수 없습니다.' });
+    }
+    const vecFriend = friendQ.rows[0].embedding_vector;
+
+    // 3) 코사인 유사도 계산
+    const score = similarity(vecUser, vecFriend);      // -1 ~ 1
+    const percent = Math.round(((score + 1) / 2) * 100); // 0 ~ 100
+
+    // 4) 결과 응답
+    res.json({ 
+      user_photo_id, 
+      friend_photo_id, 
+      cosine_similarity: score, 
+      similarity_percent: percent 
+    });
+
+  } catch (err) {
+    console.error('compare_similarity error:', err);
+    res.status(500).json({ error: '유사도 계산 중 오류가 발생했습니다.' });
   } finally {
     if (client) client.release();
   }
