@@ -15,6 +15,7 @@ const multer = require('multer');
 const path = require('path');
 const similarity = require('compute-cosine-similarity');
 const sharp = require('sharp');
+const sharp = require('sharp');
 // 2. 환경 변수 로드 (.env 파일에서)
 dotenv.config();
 
@@ -32,6 +33,7 @@ app.use(session({
   saveUninitialized: false,
   cookie: { secure: process.env.NODE_ENV === 'production', httpOnly: true }
 }));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')))
 
 // 5. PostgreSQL 데이터베이스 연결 설정
 const pool = new Pool({
@@ -135,7 +137,74 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 //----------------------------------------------------------------------------------
-app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
+app.post('/uploaduser', authenticateToken, upload.single('file'),  async (myreq, myres) => {
+  let client;
+  try {
+    client = await pool.connect();
+
+    // let meta;
+    // if (myreq.body.meta) {
+    //     try {
+    //         meta = JSON.parse(myreq.body.meta);
+    //     } catch (e) {
+    //         console.error("meta JSON 파싱 실패:", e);
+    //         return myres.status(400).json({ error: "잘못된 meta JSON 형식입니다." });
+    //     }
+    // } else {
+    //     // meta 데이터가 없는 경우 (예: curl 명령에서 meta 필드를 빼먹었을 때)
+    //     return myres.status(400).json({ error: "meta 데이터가 누락되었습니다." });
+    // }
+    const userId = myreq.user.id;
+
+    const form = new FormData();
+    form.append('file', fs.createReadStream(myreq.file.path));
+
+    const res = await axios.post('http://172.20.12.58:80/embedding', form, {
+      headers: form.getHeaders(),
+    });
+
+    const { embedding: embeddingVectorRaw, facial_area: facialArea, facial_confidence: facialConfidence } = res.data;
+    let embeddingVectorString; // 변환된 벡터 문자열을 저장할 변수
+    if (Array.isArray(embeddingVectorRaw) && embeddingVectorRaw.length === 512) {
+        // JavaScript 배열을 pgvector가 기대하는 문자열 '[val1, val2, ...]' 형태로 변환
+        embeddingVectorString = `[${embeddingVectorRaw.join(',')}]`; 
+        console.log('pgvector 형식으로 변환된 임베딩:', embeddingVectorString.substring(0, 50), '...'); // 일부만 로깅
+    } else {
+        throw new Error(`Flask로부터 받은 임베딩 벡터의 차원이 ${embeddingVectorRaw ? embeddingVectorRaw.length : '없음'}로 예상치 못한 값입니다. (기대: 1536)`);
+    }
+
+    const insertResult = await client.query(
+        // 👈 INSERT 쿼리 수정: user_id, image_url, embedding_vector, facial_area, facial_confidence를 모두 삽입
+        // uploaded_at은 DEFAULT CURRENT_TIMESTAMP이므로 쿼리에서 명시하지 않아도 됩니다.
+        'INSERT INTO user_photos (user_id, image_url, embedding_vector, uploaded_at) VALUES ($1, $2, $3, NOW()) RETURNING user_photo_id, image_url, uploaded_at',
+        [userId, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
+    );
+    const newPhoto = insertResult.rows[0];
+    const userPhotoId = newPhoto.user_photo_id;
+
+    // console.log(`사진 정보 DB에 초기 저장됨. ID: ${userPhotoId}, URL: ${fileUrl}`);
+    // console.log(`사진 ID ${userPhotoId}의 임베딩 및 얼굴 정보 DB에 업데이트 완료.`); // 이제 업데이트가 아닌 삽입 시점에 모두 저장
+
+    myres.json({
+        message: '사진이 성공적으로 업로드 및 처리되었습니다.',
+        photo: {
+            user_photo_id: newPhoto.user_photo_id,
+            image_url: newPhoto.image_url,
+            uploaded_at: newPhoto.uploaded_at,
+            facial_area: facialArea,
+            facial_confidence: facialConfidence,
+            embedding: embeddingVectorString
+        }
+    });
+  } catch (err) {
+    myres.status(500).json({ error: err.message });
+    console.log(err.message);
+  } finally {
+    if (client) client.release();
+  }
+});
+
+app.post('/uploadtarget', upload.single('file'), async (myreq, myres) => {
   let client;
   try {
     client = await pool.connect();
@@ -172,8 +241,8 @@ app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
     const insertResult = await client.query(
         // 👈 INSERT 쿼리 수정: user_id, image_url, embedding_vector, facial_area, facial_confidence를 모두 삽입
         // uploaded_at은 DEFAULT CURRENT_TIMESTAMP이므로 쿼리에서 명시하지 않아도 됩니다.
-        'INSERT INTO user_photos (user_id, image_url, embedding_vector, uploaded_at) VALUES ($1, $2, $3, NOW()) RETURNING user_photo_id, image_url, uploaded_at',
-        [meta.userid, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
+        'INSERT INTO target_photos (type, name, image_url, embedding_vector, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING *',
+        [meta.type, meta.name, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
     );
     const newPhoto = insertResult.rows[0];
     const userPhotoId = newPhoto.user_photo_id;
@@ -184,9 +253,11 @@ app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
     myres.json({
         message: '사진이 성공적으로 업로드 및 처리되었습니다.',
         photo: {
-            user_photo_id: newPhoto.user_photo_id,
+            target_photo_id: newPhoto.user_photo_id,
+            type: newPhoto.type,
+            name: newPhoto.name,
             image_url: newPhoto.image_url,
-            uploaded_at: newPhoto.uploaded_at,
+            created_at: newPhoto.created_at,
             facial_area: facialArea,
             facial_confidence: facialConfidence,
             embedding: embeddingVectorString
@@ -199,7 +270,7 @@ app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
   }
 });
 
-app.post('/targetuser', upload.single('file'), async (myreq, myres) => {
+app.post('/uploadtarget', upload.single('file'), async (myreq, myres) => {
   let client;
   try {
     client = await pool.connect();
@@ -236,8 +307,8 @@ app.post('/targetuser', upload.single('file'), async (myreq, myres) => {
     const insertResult = await client.query(
         // 👈 INSERT 쿼리 수정: user_id, image_url, embedding_vector, facial_area, facial_confidence를 모두 삽입
         // uploaded_at은 DEFAULT CURRENT_TIMESTAMP이므로 쿼리에서 명시하지 않아도 됩니다.
-        'INSERT INTO user_photos (user_id, image_url, embedding_vector, uploaded_at) VALUES ($1, $2, $3, NOW()) RETURNING user_photo_id, image_url, uploaded_at',
-        [meta.userid, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
+        'INSERT INTO target_photos (type, name, image_url, embedding_vector, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING *',
+        [meta.type, meta.name, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
     );
     const newPhoto = insertResult.rows[0];
     const userPhotoId = newPhoto.user_photo_id;
@@ -248,9 +319,11 @@ app.post('/targetuser', upload.single('file'), async (myreq, myres) => {
     myres.json({
         message: '사진이 성공적으로 업로드 및 처리되었습니다.',
         photo: {
-            user_photo_id: newPhoto.user_photo_id,
+            target_photo_id: newPhoto.user_photo_id,
+            type: newPhoto.type,
+            name: newPhoto.name,
             image_url: newPhoto.image_url,
-            uploaded_at: newPhoto.uploaded_at,
+            created_at: newPhoto.created_at,
             facial_area: facialArea,
             facial_confidence: facialConfidence,
             embedding: embeddingVectorString
@@ -261,49 +334,82 @@ app.post('/targetuser', upload.single('file'), async (myreq, myres) => {
   } finally {
     if (client) client.release();
   }
-});
+});  
 
-//------------------------------------------------------------------------------------
-app.post('/getsimilaranimal', async (req, res) => {
-  try {
-    const meta = JSON.parse(req.body.meta);
-    const { imgurl, x, y, w, h } = meta;
 
-    // 1. 이미지 crop
-    const croppedPath = `uploads/cropped_${Date.now()}.jpg`;
-    await sharp(imgurl)
-      .extract({ left: Math.round(x), top: Math.round(y), width: Math.round(w), height: Math.round(h) })
-      .toFile(croppedPath);
+app.post(
+  '/getsimilaranimal',
+  async (req, res) => {
+    console.log('Received request for /getsimilaranimal');
+    try {
+      // 1) 클라이언트 요청 본문에서 'image_url'을 추출합니다.
+      const { image_url, x, y, w, h } = req.body;
 
-    // 2. FormData 생성 및 API 요청
-    const form = new FormData();
-    form.append('file', fs.createReadStream(croppedPath));
+      // 'image_url'이 제공되었는지 확인합니다.
+      if (!image_url) {
+        return res.status(400).json({ error: 'image_url이 제공되지 않았습니다.' });
+      }
 
-    const response = await axios.post('http://172.20.12.58:80/predict', form, {
-      headers: form.getHeaders(),
-    });
+      console.log('Image URL:', image_url);
 
-    // 3. 임시 파일 삭제
-    fs.unlink(croppedPath, (err) => {
-      if (err) console.error('임시 파일 삭제 실패:', err);
-    });
+      let localPath = image_url;
+      try {
+        const urlObj = new URL(image_url);
+        // URL pathname 예: '/uploads/1752481925180.jpg'
+        localPath = `.${urlObj.pathname}`; // 서버 프로젝트 루트 기준 상대 경로
+      } catch (e) {
+        // image_url이 URL 형식이 아닐 경우 그대로 사용
+      }
 
-    // 4. 결과 반환
-    res.json({ animal: response.data.class, confidence: response.data.confidence });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: '이미지 처리 또는 API 요청 중 오류 발생' });
+      // 1. 이미지 crop
+      const croppedPath = `uploads/cropped_${Date.now()}.jpg`;
+      await sharp(localPath)
+        .extract({ left: Math.round(x), top: Math.round(y), width: Math.round(w), height: Math.round(h) })
+        .toFile(croppedPath);
+
+      // 2. FormData 생성 및 API 요청
+      const form = new FormData();
+      form.append('file', fs.createReadStream(croppedPath));
+
+      // 4) 외부 예측 API ('http://172.20.12.58:80/predict')를 호출합니다.
+      // 'form.getHeaders()'는 FormData에 필요한 'Content-Type' 헤더를 자동으로 설정합니다.
+      const response = await axios.post(
+        'http://172.20.12.58:80/predict', 
+        form, 
+        {
+          headers: form.getHeaders(),
+        });
+
+      // 3. 임시 파일 삭제
+      fs.unlink(croppedPath, (err) => {
+        if (err) console.error('임시 파일 삭제 실패:', err);
+      });
+
+      // 5) 외부 API 응답에서 'class'와 'confidence'를 추출합니다.
+      // 'class'는 'animal' 변수로 이름을 변경합니다.
+      const { class: animal, confidence } = response.data;
+
+      // 6) 클라이언트에 예측 결과를 응답합니다.
+      res.json({ animal, confidence });
+    } catch (err) {
+      // 에러 발생 시 콘솔에 로깅하고 클라이언트에 에러 응답을 보냅니다.
+      console.error('getsimilaranimal error:', err.message);
+      // Axios 에러인 경우 (예: 외부 API 연결 실패) 더 자세한 정보를 로깅합니다.
+      if (axios.isAxiosError(err)) {
+        console.error('Axios error details:', err.response?.data || err.message);
+      }
+      res.status(500).json({ error: '닮은 동물 예측에 실패했습니다.', details: err.message });
+    }
   }
-});
-
-
-
+);
   app.post('/find_most_similar', async (req, res) => {
     const { embedding_vector } = req.body; // 512차원 배열
   
     if (!embedding_vector || !Array.isArray(embedding_vector)) {
       return res.status(400).json({ error: 'embedding_vector is required and must be an array' });
     }
+
+    const vectorLiteral = `[${embedding_vector.join(',')}]`;
   
     try {
       const client = await pool.connect();
@@ -315,7 +421,7 @@ app.post('/getsimilaranimal', async (req, res) => {
         ORDER BY embedding_vector <=> $1
         LIMIT 1
       `;
-      const { rows } = await client.query(query, [embedding_vector]);
+      const { rows } = await client.query(query, [vectorLiteral]);
       client.release();
   
       if (rows.length === 0) {
