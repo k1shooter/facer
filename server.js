@@ -1126,7 +1126,68 @@ app.delete('/notifications/:notification_id', async (req, res) => {
     if (client) client.release();
   }
 });
+//-----------------------------------------------------------------------------------------
+app.post('/latest-photo-similarity', async (req, res) => {
+  const { user_id1, user_id2 } = req.body;
+  if (!user_id1 || !user_id2) {
+    return res.status(400).json({ error: 'user_id1, user_id2가 필요합니다.' });
+  }
 
+  let client;
+  try {
+    client = await pool.connect();
+
+    // 각 유저의 최신 사진 1장 조회
+    const getPhoto = async (user_id) => {
+      const result = await client.query(
+        `SELECT image_url, embedding_vector
+         FROM user_photos
+         WHERE user_id = $1
+         ORDER BY uploaded_at DESC
+         LIMIT 1`,
+        [user_id]
+      );
+      return result.rows[0];
+    };
+
+    const photo1 = await getPhoto(user_id1);
+    const photo2 = await getPhoto(user_id2);
+
+    if (!photo1 || !photo2) {
+      return res.status(404).json({ error: '두 유저 모두의 최신 사진이 필요합니다.' });
+    }
+
+    // 벡터 파싱 (Postgres vector → JS array)
+    const parseVector = (vec) => {
+      if (Array.isArray(vec)) return vec;
+      if (typeof vec === 'string') {
+        // '[0.1,0.2,0.3,...]' → [0.1, 0.2, 0.3, ...]
+        return JSON.parse(vec.replace(/^\[|\]$/g, ''));
+      }
+      return [];
+    };
+
+    const vec1 = parseVector(photo1.embedding_vector);
+    const vec2 = parseVector(photo2.embedding_vector);
+
+    if (!Array.isArray(vec1) || !Array.isArray(vec2) || vec1.length !== vec2.length) {
+      return res.status(400).json({ error: '임베딩 벡터 형식 오류' });
+    }
+
+    // cosine similarity 계산
+    const score = similarity(vec1, vec2);
+
+    res.json({
+      cosine_similarity: score,
+      user1_image_url: photo1.image_url,
+      user2_image_url: photo2.image_url
+    });
+  } catch (err) {
+    res.status(500).json({ error: '서버 오류', detail: err.message });
+  } finally {
+    if (client) client.release();
+  }
+});
   // app.post('/getsimilarity', (req,res) => {
   //   const client = pool.connect();
   //   const meta = JSON.parse(req.body.meta);
