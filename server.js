@@ -748,16 +748,22 @@ app.post('/contest_entry_add', async (req, res) => {
   try {
     client = await pool.connect();
     const getter = await client.query(
-      `SELECT embedding_vector FROM contests WHERE contest_id = $1`,[contest_id]
+      `SELECT target_embedding FROM contests WHERE contest_id = $1`,[contest_id]
     );
     const getter2=await client.query(
       `SELECT embedding_vector FROM user_photos WHERE user_id = $1 AND user_photo_id = $2`,[user_id, user_photo_id]
     );
 
-    const vec1 = getter.rows[0].embedding_vector; // 예: [0.1, 0.2, ...]
-    const vec2 = getter2.rows[0].embedding_vector;
+    const vec1 = JSON.parse(getter.rows[0].target_embedding); // 예: [0.1, 0.2, ...]
+    const vec2 = JSON.parse(getter2.rows[0].embedding_vector);
+    console.log(vec1);
+    console.log(vec2);
 
     similarity_score = similarity(vec1, vec2);
+
+    console.log("여기",similarity_score);
+    
+
 
 
     const result = await client.query(
@@ -769,7 +775,10 @@ app.post('/contest_entry_add', async (req, res) => {
     );
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+    res.status(500).json({ 
+      error: 'DB 저장 중 오류 발생' ,
+      detail: err.message
+    });
   } finally {
     if (client) client.release();
   }
