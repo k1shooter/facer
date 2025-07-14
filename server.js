@@ -199,7 +199,7 @@ app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
   }
 });
 
-app.post('/targetuser', upload.single('file'), async (myreq, myres) => {
+app.post('/uploadtarget', upload.single('file'), async (myreq, myres) => {
   let client;
   try {
     client = await pool.connect();
@@ -236,8 +236,8 @@ app.post('/targetuser', upload.single('file'), async (myreq, myres) => {
     const insertResult = await client.query(
         // 👈 INSERT 쿼리 수정: user_id, image_url, embedding_vector, facial_area, facial_confidence를 모두 삽입
         // uploaded_at은 DEFAULT CURRENT_TIMESTAMP이므로 쿼리에서 명시하지 않아도 됩니다.
-        'INSERT INTO user_photos (user_id, image_url, embedding_vector, uploaded_at) VALUES ($1, $2, $3, NOW()) RETURNING user_photo_id, image_url, uploaded_at',
-        [meta.userid, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
+        'INSERT INTO target_photos (type, name, image_url, embedding_vector, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING *',
+        [meta.type, meta.name, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
     );
     const newPhoto = insertResult.rows[0];
     const userPhotoId = newPhoto.user_photo_id;
@@ -248,9 +248,11 @@ app.post('/targetuser', upload.single('file'), async (myreq, myres) => {
     myres.json({
         message: '사진이 성공적으로 업로드 및 처리되었습니다.',
         photo: {
-            user_photo_id: newPhoto.user_photo_id,
+            target_photo_id: newPhoto.user_photo_id,
+            type: newPhoto.type,
+            name: newPhoto.name,
             image_url: newPhoto.image_url,
-            uploaded_at: newPhoto.uploaded_at,
+            created_at: newPhoto.created_at,
             facial_area: facialArea,
             facial_confidence: facialConfidence,
             embedding: embeddingVectorString
@@ -528,6 +530,30 @@ app.patch('/update_contest_top3', async (req, res) => {
   }
 });
 
+// PATCH /contests/status
+app.patch('/contests/status', async (req, res) => {
+  const { contest_id, status } = req.body;
+  if (!contest_id || !status) {
+    return res.status(400).json({ error: 'contest_id와 status가 필요합니다.' });
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      'UPDATE contests SET status = $1 WHERE contest_id = $2 RETURNING *',
+      [status, contest_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '해당 콘테스트를 찾을 수 없습니다.' });
+    }
+    res.json({ message: 'status 수정 완료', contest: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'status 수정 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 //---------------------------------------------------------------------------------
 app.post('/notification_add', async (req, res) => {
   const {
@@ -587,7 +613,59 @@ app.post('/friendship_add', async (req, res) => {
     if (client) client.release();
   }
 });
+//--------------------------------------------------------------------------------
+app.patch('/update_isonline', async (req, res) => {
+  const { is_online, user_id } = req.body;
 
+  if (!is_online) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+
+    const result = await client.query(
+      `UPDATE users 
+       SET is_online = $1
+       WHERE user_id = $2 
+       RETURNING *`,
+      [
+        is_online,
+        user_id
+      ]
+    );
+
+    res.json(
+      result.rows[0]
+    );
+  } catch (err) {
+    res.status(500).json({ error: '온라인 상태 업데이트 실패패' });
+  } finally {
+    if (client) client.release();
+  }
+});
+//--------------------------------------------------------------------------
+// DELETE /notifications/:notification_id
+app.delete('/notifications/:notification_id', async (req, res) => {
+  const { notification_id } = req.params;
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      'DELETE FROM notifications WHERE notification_id = $1 RETURNING *',
+      [notification_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '해당 알림을 찾을 수 없습니다.' });
+    }
+    res.json({ message: '알림이 성공적으로 삭제되었습니다.', deleted: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: '알림 삭제 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
 
   app.post('/getsimilarity', (req,res) => {
     const client = pool.connect();
