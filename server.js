@@ -15,7 +15,6 @@ const multer = require('multer');
 const path = require('path');
 const similarity = require('compute-cosine-similarity');
 const sharp = require('sharp');
-const sharp = require('sharp');
 // 2. 환경 변수 로드 (.env 파일에서)
 dotenv.config();
 
