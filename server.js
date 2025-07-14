@@ -584,6 +584,34 @@ app.post('/notification_add', async (req, res) => {
   }
 });
 
+app.post('/notification_delete', async (req, res) => {
+  const {
+    user_id,
+    notification_id,
+    } = req.body;
+
+  // 필수값 체크
+  if (!user_id || !notification_id) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      `DELETE FROM notifications 
+       WHERE user_id=$1 AND notification_id=$2
+       RETURNING *`,
+      [user_id, notification_id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 app.post('/friendship_add', async (req, res) => {
   const {
     requester_user_id,
@@ -604,7 +632,7 @@ app.post('/friendship_add', async (req, res) => {
         (requester_user_id, receiver_user_id, status, requested_at, responded_at)
        VALUES ($1, $2, $3, NOW(), NULL)
        RETURNING *`,
-      [requester_user_id, receiver_user_id, status, false]
+      [requester_user_id, receiver_user_id, status]
     );
     res.json(result.rows[0]);
   } catch (err) {
@@ -613,6 +641,37 @@ app.post('/friendship_add', async (req, res) => {
     if (client) client.release();
   }
 });
+
+app.delete('/friendship_delete', async (req, res) => {
+  const {
+    requester_user_id,
+    receiver_user_id,
+    status,
+    } = req.body;
+
+  // 필수값 체크
+  if (!requester_user_id || !receiver_user_id || !status) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      `DELETE FROM friendships 
+       WHERE requester_user_id=$1 AND receiver_user_id=$2
+       RETURNING *`,
+      [requester_user_id, receiver_user_id]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+
 //--------------------------------------------------------------------------------
 app.patch('/update_isonline', async (req, res) => {
   const { is_online, user_id } = req.body;
