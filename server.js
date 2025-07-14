@@ -766,17 +766,25 @@ app.get('/notifications', authenticateToken, async (req, res) => {
     const { rows } = await client.query(
       `SELECT 
          notification_id,
-         type,
          message,
          is_read,
-         created_at
+         created_at,
+         friendships_id
        FROM notifications
        WHERE user_id = $1
        ORDER BY created_at DESC`,
       [userId]
     );
 
-    res.json(rows);
+    const notifications = rows.map(r => ({
+      notification_id:             r.notification_id,
+      message:        r.message,
+      is_read:         r.is_read,
+      created_at:      r.created_at,
+      friendships_id:   r.friendships_id  // 프론트에서는 여기로 사용
+    }));
+
+    res.json(notifications);
   } catch (err) {
     console.error('GET /notifications error:', err);
     res.status(500).json({ error: '알림 목록 조회 중 오류가 발생했습니다.' });
@@ -785,14 +793,16 @@ app.get('/notifications', authenticateToken, async (req, res) => {
   }
 });
 
+
 app.post('/notification_add', async (req, res) => {
   const {
     user_id,
-    type,
-    message} = req.body;
+    message,
+    friendships_id   // 여기도 함께 받아옵니다
+  } = req.body;
 
   // 필수값 체크
-  if (!user_id || !type || !message) {
+  if (!user_id || !message || !friendships_id) {
     return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
   }
 
@@ -801,13 +811,14 @@ app.post('/notification_add', async (req, res) => {
     client = await pool.connect();
     const result = await client.query(
       `INSERT INTO notifications 
-        (user_id, type, message, is_read, created_at)
+        (user_id, message, friendships_id, is_read, created_at)
        VALUES ($1, $2, $3, $4, NOW())
        RETURNING *`,
-      [user_id, type, message, false]
+      [user_id, message, friendships_id, false]
     );
     res.json(result.rows[0]);
   } catch (err) {
+    console.error('POST /notification_add error:', err);
     res.status(500).json({ error: 'DB 저장 중 오류 발생' });
   } finally {
     if (client) client.release();
@@ -842,20 +853,8 @@ app.post('/notification_delete', async (req, res) => {
   }
 });
 
-app.post('/friendship_add', async (req, res) => {
-  const {
-    requester_user_id,
-    receiver_user_id,
-    status,
-    } = req.body;
-
-  // 필수값 체크
-  if (!requester_user_id || !receiver_user_id || !status) {
-    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
-  }
-
-  //친구 요청, 수락
-  app.patch(
+// (1) 친구 요청 수락/거절용 PATCH 라우트 — 최상위에 선언
+app.patch(
   '/friendship/:friendship_id',
   authenticateToken,
   async (req, res) => {
@@ -869,47 +868,71 @@ app.post('/friendship_add', async (req, res) => {
     let client;
     try {
       client = await pool.connect();
-
       const result = await client.query(
         `UPDATE friendships
            SET status = $1,
                responded_at = NOW()
-         WHERE friendship_id = $2
+         WHERE friendships_id = $2
          RETURNING *`,
         [status, friendship_id]
       );
-      
       if (result.rows.length === 0) {
         return res.status(404).json({ error: '해당 friendship_id를 찾을 수 없습니다.' });
       }
-
       res.json(result.rows[0]);
     } catch (err) {
       console.error('PATCH /friendship/:friendship_id error:', err);
       res.status(500).json({ error: '친구 요청 업데이트 중 오류가 발생했습니다.' });
     } finally {
-      if (client) client.release();
+      client?.release();
     }
   }
 );
+
+// (2) 친구 요청 생성용 POST 라우트 — 별도 선언
+app.post('/friendship_add', async (req, res) => {
+  const {
+    requester_user_id,
+    receiver_user_id,
+    status,
+  } = req.body;
+
+  if (!requester_user_id || !receiver_user_id || !status) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
 
   let client;
   try {
     client = await pool.connect();
     const result = await client.query(
       `INSERT INTO friendships 
-        (requester_user_id, receiver_user_id, status, requested_at, responded_at)
+         (requester_user_id, receiver_user_id, status, requested_at, responded_at)
        VALUES ($1, $2, $3, NOW(), NULL)
        RETURNING *`,
       [requester_user_id, receiver_user_id, status]
     );
     res.json(result.rows[0]);
   } catch (err) {
-    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+    console.error('=== DB ERROR START ===');
+    console.error(err);               // err.message + err.code 등 기본 출력
+    console.error(err.stack);         // 스택 트레이스
+    console.error('detail:', err.detail);   // PG 에러 객체에만 있는 상세 메시지
+    console.error('hint:', err.hint);       // (있으면) 힌트 정보
+    console.error('constraint:', err.constraint); // 위반된 제약조건 이름
+    console.error('=== DB ERROR END ===');
+    console.error('POST /friendship_add error:', err);
+    res.status(500).json({
+      error: err.message,      // 일반 에러 메시지
+      code: err.code,          // Postgres 에러 코드 (예: '23505' 등)
+      detail: err.detail,      // 제약 위반 등 상세 설명
+      hint: err.hint,          // (있으면) 힌트
+      constraint: err.constraint, // (있으면) 제약조건 이름
+    });
   } finally {
-    if (client) client.release();
+    client?.release();
   }
 });
+
 
 app.delete('/friendship_delete', async (req, res) => {
   const {
@@ -950,7 +973,7 @@ app.get('/friends', authenticateToken, async (req, res) => {
     const result = await client.query(
       `
       SELECT
-        f.friendship_id,
+        f.friendships_id,
         f.requester_user_id,
         f.receiver_user_id,
         f.status,
@@ -965,14 +988,14 @@ app.get('/friends', authenticateToken, async (req, res) => {
         ON ( (f.requester_user_id = $1 AND u.user_id = f.receiver_user_id)
           OR (f.receiver_user_id = $1 AND u.user_id = f.requester_user_id) )
       WHERE (f.requester_user_id = $1 OR f.receiver_user_id = $1)
-        AND f.status='accpeted'
+        AND f.status='accepted'
       ORDER BY f.requested_at DESC
       `,
       [me]
     );
 
     const friends = result.rows.map(row => ({
-      friendshipId:       row.friendship_id,
+      friendshipId:       row.friendships_id,
       status:             row.status,               // 'pending', 'accepted', 'rejected'
       direction:          row.requester_user_id === me ? 'outgoing' : 'incoming',
       requestedAt:        row.requested_at,
@@ -1104,19 +1127,19 @@ app.delete('/notifications/:notification_id', async (req, res) => {
   }
 });
 
-  app.post('/getsimilarity', (req,res) => {
-    const client = pool.connect();
-    const meta = JSON.parse(req.body.meta);
-    const vecA = meta.vec1; // 512차원 배열
-    const vecB = meta.vec2; // 512차원 배열
-    const score = similarity(vecA, vecB);
-    const percent = ((score + 1) / 2) * 100
-    console.log(percent); // -1 ~ 1 사이의 값
-    client.query('INSERT INTO similarity_results (user_photo_id, target_type, target_photo_id, uploaded_photo_id, similarity_score, analyzed_at) VALUES ($1,$2,$3,$4,NOW()) RETURNING *',
-        [meta.user_photo_id, meta.target_photo_id, meta.uploaded_photo_id, percent]);
-    res.json({score:percent});
-    }
-  );
+  // app.post('/getsimilarity', (req,res) => {
+  //   const client = pool.connect();
+  //   const meta = JSON.parse(req.body.meta);
+  //   const vecA = meta.vec1; // 512차원 배열
+  //   const vecB = meta.vec2; // 512차원 배열
+  //   const score = similarity(vecA, vecB);
+  //   const percent = ((score + 1) / 2) * 100
+  //   console.log(percent); // -1 ~ 1 사이의 값
+  //   client.query('INSERT INTO similarity_results (user_photo_id, target_type, target_photo_id, uploaded_photo_id, similarity_score, analyzed_at) VALUES ($1,$2,$3,$4,NOW()) RETURNING *',
+  //       [meta.user_photo_id, meta.target_photo_id, meta.uploaded_photo_id, percent]);
+  //   res.json({score:percent});
+  //   }
+  // );
   // 예시 보호된 라우트
   app.get('/api/profile', authenticateToken, (req, res) => {
     res.json({ message: '프로필 정보 접근 허용', user: req.user });
