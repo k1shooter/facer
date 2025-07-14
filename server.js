@@ -14,6 +14,7 @@ const fs = require('fs');
 const multer = require('multer');
 const path = require('path');
 const similarity = require('compute-cosine-similarity');
+const sharp = require('sharp');
 // 2. 환경 변수 로드 (.env 파일에서)
 dotenv.config();
 
@@ -198,24 +199,104 @@ app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
   }
 });
 
-  app.post('/getsimilaranimal',(myreq,myres) => {
+app.post('/targetuser', upload.single('file'), async (myreq, myres) => {
+  let client;
+  try {
+    client = await pool.connect();
+
+    let meta;
+    if (myreq.body.meta) {
+        try {
+            meta = JSON.parse(myreq.body.meta);
+        } catch (e) {
+            console.error("meta JSON 파싱 실패:", e);
+            return myres.status(400).json({ error: "잘못된 meta JSON 형식입니다." });
+        }
+    } else {
+        // meta 데이터가 없는 경우 (예: curl 명령에서 meta 필드를 빼먹었을 때)
+        return myres.status(400).json({ error: "meta 데이터가 누락되었습니다." });
+    }
     const form = new FormData();
-    const meta = JSON.parse(myreq.body.meta);
-    form.append('file', fs.createReadStream(meta.imgurl));
+    form.append('file', fs.createReadStream(myreq.file.path));
 
-    axios
-      .post('http://172.20.12.58:80/predict', form, {
-        headers: form.getHeaders(),
-      })
-      .then((res) => {
-        console.log(res.data);
-        myres.json({ animal: res.data.class, confidence: res.data.confidence });
-      })
-      .catch((err) => {
-        console.error(err);
-      });
+    const res = await axios.post('http://172.20.12.58:80/embedding', form, {
+      headers: form.getHeaders(),
+    });
 
-  });
+    const { embedding: embeddingVectorRaw, facial_area: facialArea, facial_confidence: facialConfidence } = res.data;
+    let embeddingVectorString; // 변환된 벡터 문자열을 저장할 변수
+    if (Array.isArray(embeddingVectorRaw) && embeddingVectorRaw.length === 512) {
+        // JavaScript 배열을 pgvector가 기대하는 문자열 '[val1, val2, ...]' 형태로 변환
+        embeddingVectorString = `[${embeddingVectorRaw.join(',')}]`; 
+        console.log('pgvector 형식으로 변환된 임베딩:', embeddingVectorString.substring(0, 50), '...'); // 일부만 로깅
+    } else {
+        throw new Error(`Flask로부터 받은 임베딩 벡터의 차원이 ${embeddingVectorRaw ? embeddingVectorRaw.length : '없음'}로 예상치 못한 값입니다. (기대: 1536)`);
+    }
+
+    const insertResult = await client.query(
+        // 👈 INSERT 쿼리 수정: user_id, image_url, embedding_vector, facial_area, facial_confidence를 모두 삽입
+        // uploaded_at은 DEFAULT CURRENT_TIMESTAMP이므로 쿼리에서 명시하지 않아도 됩니다.
+        'INSERT INTO user_photos (user_id, image_url, embedding_vector, uploaded_at) VALUES ($1, $2, $3, NOW()) RETURNING user_photo_id, image_url, uploaded_at',
+        [meta.userid, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
+    );
+    const newPhoto = insertResult.rows[0];
+    const userPhotoId = newPhoto.user_photo_id;
+
+    // console.log(`사진 정보 DB에 초기 저장됨. ID: ${userPhotoId}, URL: ${fileUrl}`);
+    // console.log(`사진 ID ${userPhotoId}의 임베딩 및 얼굴 정보 DB에 업데이트 완료.`); // 이제 업데이트가 아닌 삽입 시점에 모두 저장
+
+    myres.json({
+        message: '사진이 성공적으로 업로드 및 처리되었습니다.',
+        photo: {
+            user_photo_id: newPhoto.user_photo_id,
+            image_url: newPhoto.image_url,
+            uploaded_at: newPhoto.uploaded_at,
+            facial_area: facialArea,
+            facial_confidence: facialConfidence,
+            embedding: embeddingVectorString
+        }
+    });
+  } catch (err) {
+    myres.status(500).json({ error: err.message });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+//------------------------------------------------------------------------------------
+app.post('/getsimilaranimal', async (req, res) => {
+  try {
+    const meta = JSON.parse(req.body.meta);
+    const { imgurl, x, y, w, h } = meta;
+
+    // 1. 이미지 crop
+    const croppedPath = `uploads/cropped_${Date.now()}.jpg`;
+    await sharp(imgurl)
+      .extract({ left: Math.round(x), top: Math.round(y), width: Math.round(w), height: Math.round(h) })
+      .toFile(croppedPath);
+
+    // 2. FormData 생성 및 API 요청
+    const form = new FormData();
+    form.append('file', fs.createReadStream(croppedPath));
+
+    const response = await axios.post('http://172.20.12.58:80/predict', form, {
+      headers: form.getHeaders(),
+    });
+
+    // 3. 임시 파일 삭제
+    fs.unlink(croppedPath, (err) => {
+      if (err) console.error('임시 파일 삭제 실패:', err);
+    });
+
+    // 4. 결과 반환
+    res.json({ animal: response.data.class, confidence: response.data.confidence });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: '이미지 처리 또는 API 요청 중 오류 발생' });
+  }
+});
+
+
 
   app.post('/find_most_similar', async (req, res) => {
     const { embedding_vector } = req.body; // 512차원 배열
@@ -248,6 +329,264 @@ app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
       return res.status(500).json({ error: 'Internal server error' });
     }
   });
+//-------------------------------------------------------------------------------------------------
+
+app.get('/searchnickname', async (req, res) => {
+  const { nickname } = req.query;
+  if (!nickname) {
+    return res.status(400).json({ error: 'nickname 파라미터가 필요합니다.' });
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      'SELECT * FROM users WHERE nickname = $1',
+      [nickname]
+    );
+    res.json(result.rows); // 닉네임이 일치하는 모든 유저 정보 반환
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'DB 조회 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+
+app.patch('/userupdate', async (req, res) => {
+  const { userid, nickname, profile_image_url, is_online } = req.body;
+  if (!userid) {
+    return res.status(400).json({ error: 'userid가 필요합니다.' });
+  }
+
+  // 변경할 필드만 동적으로 쿼리 생성
+  const fields = [];
+  const values = [];
+  let idx = 1;
+
+  if (nickname !== undefined) {
+    fields.push(`nickname = $${idx++}`);
+    values.push(nickname);
+  }
+  if (profile_image_url !== undefined) {
+    fields.push(`profile_image_url = $${idx++}`);
+    values.push(profile_image_url);
+  }
+  if (is_online !== undefined) {
+    fields.push(`is_online = $${idx++}`);
+    values.push(is_online);
+  }
+
+  if (fields.length === 0) {
+    return res.status(400).json({ error: '수정할 값이 없습니다.' });
+  }
+
+  values.push(userid);
+
+  const sql = `UPDATE users SET ${fields.join(', ')} WHERE user_id = $${idx} RETURNING *`;
+
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(sql, values);
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '해당 유저를 찾을 수 없습니다.' });
+    }
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'DB 업데이트 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+//-----------------------------------------------------------------------------------------
+
+app.post('/contestsadd', async (req, res) => {
+  const {
+    target_type,
+    target_name,
+    target_photo_id,
+    title,
+    description,
+    status
+  } = req.body;
+
+  // 필수값 체크
+  if (!target_type || !target_name || !target_photo_id || !title || !description || !status) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      `INSERT INTO contests 
+        (target_type, target_name, target_photo_id, title, description, status, start_date)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
+       RETURNING *`,
+      [target_type, target_name, target_photo_id, title, description, status]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+app.post('/contest_entry_add', async (req, res) => {
+  const {
+    contest_id,
+    user_id,
+    user_photo_id,
+  } = req.body;
+
+  // 필수값 체크
+  if (!contest_id || !user_id || !user_photo_id) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let similarity_score
+
+  let client;
+  try {
+    client = await pool.connect();
+    const getter = await client.query(
+      `SELECT embedding_vector FROM contests WHERE contest_id = $1`,[contest_id]
+    );
+    const getter2=await client.query(
+      `SELECT embedding_vector FROM user_photos WHERE user_id = $1 AND user_photo_id = $2`,[user_id, user_photo_id]
+    );
+
+    const vec1 = getter.rows[0].embedding_vector; // 예: [0.1, 0.2, ...]
+    const vec2 = getter2.rows[0].embedding_vector;
+
+    similarity_score = similarity(vec1, vec2);
+
+
+    const result = await client.query(
+      `INSERT INTO contest_entries 
+        (contest_id, user_id, user_photo_id, similarity_score, submitted_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING *`,
+      [contest_id, user_id, user_photo_id, similarity_score]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+app.patch('/update_contest_top3', async (req, res) => {
+  const { contest_id } = req.body;
+
+  if (!contest_id) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    const getter = await client.query(
+      `SELECT * FROM contest_entries WHERE contest_id = $1 ORDER BY similarity_score DESC LIMIT 3`,
+      [contest_id]
+    );
+
+    // 엔트리가 3개 미만일 경우 null로 채움
+    const first = getter.rows[0] || {};
+    const second = getter.rows[1] || {};
+    const third = getter.rows[2] || {};
+
+    const result = await client.query(
+      `UPDATE contests 
+       SET first_user_id=$1, second_user_id=$2, third_user_id=$3
+       WHERE contest_id = $4 
+       RETURNING *`,
+      [
+        first.user_id || null,
+        second.user_id || null,
+        third.user_id || null,
+        contest_id
+      ]
+    );
+
+    res.json({
+      first_photo_id: first.user_photo_id || null,
+      second_photo_id: second.user_photo_id || null,
+      third_photo_id: third.user_photo_id || null,
+      first_score: first.similarity_score || null,
+      second_score: second.similarity_score || null,
+      third_score: third.similarity_score || null
+    });
+  } catch (err) {
+    res.status(500).json({ error: '123등 업데이트 실패 ㅎㅎ' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+//---------------------------------------------------------------------------------
+app.post('/notification_add', async (req, res) => {
+  const {
+    user_id,
+    type,
+    message} = req.body;
+
+  // 필수값 체크
+  if (!user_id || !type || !message) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      `INSERT INTO notifications 
+        (user_id, type, message, is_read, created_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       RETURNING *`,
+      [user_id, type, message, false]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+app.post('/friendship_add', async (req, res) => {
+  const {
+    requester_user_id,
+    receiver_user_id,
+    status,
+    } = req.body;
+
+  // 필수값 체크
+  if (!requester_user_id || !receiver_user_id || !status) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      `INSERT INTO friendships 
+        (requester_user_id, receiver_user_id, status, requested_at, responded_at)
+       VALUES ($1, $2, $3, NOW(), NULL)
+       RETURNING *`,
+      [requester_user_id, receiver_user_id, status, false]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
 
 
   app.post('/getsimilarity', (req,res) => {
