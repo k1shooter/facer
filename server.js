@@ -1188,6 +1188,137 @@ app.post('/latest-photo-similarity', async (req, res) => {
     if (client) client.release();
   }
 });
+//--------------------------------------------------------------------------------------
+app.get('/contest-top3', async (req, res) => {
+  const { contest_id } = req.query;
+  if (!contest_id) {
+    return res.status(400).json({ error: 'contest_id가 필요합니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+
+    // 1. 콘테스트에서 1,2,3등 user_id 조회
+    const contestResult = await client.query(
+      `SELECT first_user_id, second_user_id, third_user_id FROM contests WHERE contest_id = $1`,
+      [contest_id]
+    );
+    if (contestResult.rows.length === 0) {
+      return res.status(404).json({ error: '해당 콘테스트를 찾을 수 없습니다.' });
+    }
+    const { first_user_id, second_user_id, third_user_id } = contestResult.rows[0];
+
+    // 2. 각 등수별 정보 추출 함수
+    const getEntryInfo = async (user_id) => {
+      if (!user_id) return null;
+      // 2-1. contest_entries에서 해당 user의 entry 찾기
+      const entry = await client.query(
+        `SELECT similarity_score, user_photo_id FROM contest_entries
+         WHERE contest_id = $1 AND user_id = $2
+         ORDER BY similarity_score DESC LIMIT 1`,
+        [contest_id, user_id]
+      );
+      if (entry.rows.length === 0) return null;
+      const { similarity_score, user_photo_id } = entry.rows[0];
+
+      // 2-2. user_photos에서 이미지 url 찾기
+      const photo = await client.query(
+        `SELECT image_url FROM user_photos WHERE user_photo_id = $1`,
+        [user_photo_id]
+      );
+      const image_url = photo.rows.length > 0 ? photo.rows[0].image_url : null;
+
+      return {
+        user_id,
+        similarity_score,
+        user_photo_id,
+        image_url,
+      };
+    };
+
+    // 3. 1,2,3등 정보 병렬 조회
+    const [first, second, third] = await Promise.all([
+      getEntryInfo(first_user_id),
+      getEntryInfo(second_user_id),
+      getEntryInfo(third_user_id),
+    ]);
+
+    res.json({
+      first: first || null,
+      second: second || null,
+      third: third || null,
+    });
+  } catch (err) {
+    res.status(500).json({ error: '서버 오류', detail: err.message });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+app.get('/contest-entry-check', async (req, res) => {
+  const { contest_id, user_id } = req.query;
+
+  if (!contest_id || !user_id) {
+    return res.status(400).json({ error: 'contest_id와 user_id가 필요합니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+
+    const result = await client.query(
+      `SELECT * FROM contest_entries WHERE contest_id = $1 AND user_id = $2 LIMIT 1`,
+      [contest_id, user_id]
+    );
+
+    if (result.rows.length > 0) {
+      res.json({
+        exists: true,
+        entry: result.rows[0]
+      });
+    } else {
+      res.json({
+        exists: false,
+        entry: null
+      });
+    }
+  } catch (err) {
+    console.error('GET /contest-entry-check error:', err);
+    res.status(500).json({ error: '참가 여부 조회 중 오류가 발생했습니다.' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+app.get('/latest-user-photo-id/:user_id', async (req, res) => {
+  const { user_id } = req.params;
+  if (!user_id) {
+    return res.status(400).json({ error: 'user_id가 필요합니다.' });
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      `SELECT user_photo_id
+         FROM user_photos
+        WHERE user_id = $1
+        ORDER BY uploaded_at DESC
+        LIMIT 1`,
+      [user_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '해당 유저의 사진이 없습니다.' });
+    }
+    res.json({ user_photo_id: result.rows[0].user_photo_id });
+  } catch (err) {
+    res.status(500).json({ error: 'DB 조회 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
+
   // app.post('/getsimilarity', (req,res) => {
   //   const client = pool.connect();
   //   const meta = JSON.parse(req.body.meta);
