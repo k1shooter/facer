@@ -139,7 +139,18 @@ app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
   try {
     client = await pool.connect();
 
-    const meta = JSON.parse(myreq.body.meta);
+    let meta;
+    if (myreq.body.meta) {
+        try {
+            meta = JSON.parse(myreq.body.meta);
+        } catch (e) {
+            console.error("meta JSON 파싱 실패:", e);
+            return myres.status(400).json({ error: "잘못된 meta JSON 형식입니다." });
+        }
+    } else {
+        // meta 데이터가 없는 경우 (예: curl 명령에서 meta 필드를 빼먹었을 때)
+        return myres.status(400).json({ error: "meta 데이터가 누락되었습니다." });
+    }
     const form = new FormData();
     form.append('file', fs.createReadStream(myreq.file.path));
 
@@ -147,12 +158,39 @@ app.post('/uploaduser', upload.single('file'), async (myreq, myres) => {
       headers: form.getHeaders(),
     });
 
-    await client.query(
-      'INSERT INTO user_photos (image_url, embedding_vector, uploaded_at) VALUES ($1,$2,$3,NOW()) RETURNING *',
-      [meta.userid, myreq.file.path, res.data.embedding]
-    );
+    const { embedding: embeddingVectorRaw, facial_area: facialArea, facial_confidence: facialConfidence } = res.data;
+    let embeddingVectorString; // 변환된 벡터 문자열을 저장할 변수
+    if (Array.isArray(embeddingVectorRaw) && embeddingVectorRaw.length === 512) {
+        // JavaScript 배열을 pgvector가 기대하는 문자열 '[val1, val2, ...]' 형태로 변환
+        embeddingVectorString = `[${embeddingVectorRaw.join(',')}]`; 
+        console.log('pgvector 형식으로 변환된 임베딩:', embeddingVectorString.substring(0, 50), '...'); // 일부만 로깅
+    } else {
+        throw new Error(`Flask로부터 받은 임베딩 벡터의 차원이 ${embeddingVectorRaw ? embeddingVectorRaw.length : '없음'}로 예상치 못한 값입니다. (기대: 1536)`);
+    }
 
-    myres.json({ filePath: myreq.file.path, embedding: res.data.embedding });
+    const insertResult = await client.query(
+        // 👈 INSERT 쿼리 수정: user_id, image_url, embedding_vector, facial_area, facial_confidence를 모두 삽입
+        // uploaded_at은 DEFAULT CURRENT_TIMESTAMP이므로 쿼리에서 명시하지 않아도 됩니다.
+        'INSERT INTO user_photos (user_id, image_url, embedding_vector, uploaded_at) VALUES ($1, $2, $3, NOW()) RETURNING user_photo_id, image_url, uploaded_at',
+        [meta.userid, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
+    );
+    const newPhoto = insertResult.rows[0];
+    const userPhotoId = newPhoto.user_photo_id;
+
+    // console.log(`사진 정보 DB에 초기 저장됨. ID: ${userPhotoId}, URL: ${fileUrl}`);
+    // console.log(`사진 ID ${userPhotoId}의 임베딩 및 얼굴 정보 DB에 업데이트 완료.`); // 이제 업데이트가 아닌 삽입 시점에 모두 저장
+
+    myres.json({
+        message: '사진이 성공적으로 업로드 및 처리되었습니다.',
+        photo: {
+            user_photo_id: newPhoto.user_photo_id,
+            image_url: newPhoto.image_url,
+            uploaded_at: newPhoto.uploaded_at,
+            facial_area: facialArea,
+            facial_confidence: facialConfidence,
+            embedding: embeddingVectorString
+        }
+    });
   } catch (err) {
     myres.status(500).json({ error: err.message });
   } finally {
