@@ -634,6 +634,30 @@ app.patch('/update_contest_top3', async (req, res) => {
   }
 });
 
+// PATCH /contests/status
+app.patch('/contests/status', async (req, res) => {
+  const { contest_id, status } = req.body;
+  if (!contest_id || !status) {
+    return res.status(400).json({ error: 'contest_id와 status가 필요합니다.' });
+  }
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      'UPDATE contests SET status = $1 WHERE contest_id = $2 RETURNING *',
+      [status, contest_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '해당 콘테스트를 찾을 수 없습니다.' });
+    }
+    res.json({ message: 'status 수정 완료', contest: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: 'status 수정 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
+
 //---------------------------------------------------------------------------------
 app.post('/notification_add', async (req, res) => {
   const {
@@ -693,7 +717,59 @@ app.post('/friendship_add', async (req, res) => {
     if (client) client.release();
   }
 });
+//--------------------------------------------------------------------------------
+app.patch('/update_isonline', async (req, res) => {
+  const { is_online, user_id } = req.body;
 
+  if (!is_online) {
+    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+  }
+
+  let client;
+  try {
+    client = await pool.connect();
+
+    const result = await client.query(
+      `UPDATE users 
+       SET is_online = $1
+       WHERE user_id = $2 
+       RETURNING *`,
+      [
+        is_online,
+        user_id
+      ]
+    );
+
+    res.json(
+      result.rows[0]
+    );
+  } catch (err) {
+    res.status(500).json({ error: '온라인 상태 업데이트 실패패' });
+  } finally {
+    if (client) client.release();
+  }
+});
+//--------------------------------------------------------------------------
+// DELETE /notifications/:notification_id
+app.delete('/notifications/:notification_id', async (req, res) => {
+  const { notification_id } = req.params;
+  let client;
+  try {
+    client = await pool.connect();
+    const result = await client.query(
+      'DELETE FROM notifications WHERE notification_id = $1 RETURNING *',
+      [notification_id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: '해당 알림을 찾을 수 없습니다.' });
+    }
+    res.json({ message: '알림이 성공적으로 삭제되었습니다.', deleted: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: '알림 삭제 중 오류 발생' });
+  } finally {
+    if (client) client.release();
+  }
+});
 
   app.post('/getsimilarity', (req,res) => {
     const client = pool.connect();
