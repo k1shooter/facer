@@ -1252,10 +1252,16 @@ app.post('/latest-photo-similarity', async (req, res) => {
 
     // 벡터 파싱 (Postgres vector → JS array)
     const parseVector = (vec) => {
-      if (Array.isArray(vec)) return vec;
+      if (Array.isArray(vec)) {
+        return vec.map(Number);
+      }
       if (typeof vec === 'string') {
-        // '[0.1,0.2,0.3,...]' → [0.1, 0.2, 0.3, ...]
-        return JSON.parse(vec.replace(/^\[|\]$/g, ''));
+        try {
+          return JSON.parse(vec);
+        } catch (e) {
+          console.error('벡터 JSON 파싱 실패, vec=', vec, e);
+          return [];
+        }
       }
       return [];
     };
