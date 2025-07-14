@@ -78,7 +78,18 @@ function authenticateToken(req, res, next) {
   const token = auth && auth.split(' ')[1];
   if (!token) return res.status(401).json({ message: '토큰이 없습니다.' });
   jwt.verify(token, process.env.JWT_SECRET, (err, payload) => {
-    if (err) return res.status(403).json({ message: '유효하지 않은 토큰입니다.' });
+    if (err) {
+      if (err.name === 'TokenExpiredError') {
+        // 만료된 토큰
+        return res.status(401).json({ message: '토큰이 만료되었습니다.' });
+      }
+      return res.status(403).json({ 
+        message: '유효하지 않은 토큰입니다.', 
+        error: err.message,       // 예: jwt malformed
+        name:  err.name,          // JsonWebTokenError 등
+        stack: err.stack,
+      });
+    }
     req.user = { id: payload.id, nickname: payload.nickname };
     next();
   });
@@ -603,39 +614,121 @@ app.patch('/userupdate', async (req, res) => {
 });
 
 //-----------------------------------------------------------------------------------------
+// server.js
 
-app.post('/contestsadd', async (req, res) => {
-  const {
-    target_type,
-    target_name,
-    target_photo_id,
-    title,
-    description,
-    status
-  } = req.body;
-
-  // 필수값 체크
-  if (!target_type || !target_name || !target_photo_id || !title || !description || !status) {
-    return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
-  }
-
+// GET /contests — 콘테스트 목록 + 참가자
+app.get('/contests', authenticateToken, async (req, res) => {
   let client;
   try {
     client = await pool.connect();
-    const result = await client.query(
-      `INSERT INTO contests 
-        (target_type, target_name, target_photo_id, title, description, status, start_date)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW())
-       RETURNING *`,
-      [target_type, target_name, target_photo_id, title, description, status]
-    );
-    res.json(result.rows[0]);
+    const { rows } = await client.query(`
+      SELECT
+        c.contest_id,
+        c.title,
+        c.description,
+        c.target_name,
+        c.target_image_url,
+        c.status,
+        COALESCE(
+          json_agg(
+            json_build_object(
+              'user_id', u.user_id,
+              'nickname', u.nickname,
+              'profile_image_url', u.profile_image_url
+            )
+          ) FILTER (WHERE u.user_id IS NOT NULL),
+        '[]'
+        ) AS participants
+      FROM contests c
+      LEFT JOIN contest_entries ce
+        ON ce.contest_id = c.contest_id
+      LEFT JOIN users u
+        ON u.user_id = ce.user_id
+      GROUP BY
+        c.contest_id,
+        c.title,
+        c.description,
+        c.target_name,
+        c.target_image_url,
+        c.status
+      ORDER BY c.start_date DESC
+    `);
+    res.json(rows);
   } catch (err) {
-    res.status(500).json({ error: 'DB 저장 중 오류 발생' });
+    console.error('GET /contests error:', err);
+    res.status(500).json({ error: '콘테스트 목록 조회 중 오류 발생' });
   } finally {
-    if (client) client.release();
+    client?.release();
   }
 });
+
+
+app.post(
+  '/contestsadd',
+  authenticateToken,      // 로그인 필요 없으면 제거
+  upload.single('file'),  // form-data의 file 필드
+  async (req, res) => {
+    const {
+      target_name,
+      title,
+      description,
+      status
+    } = req.body;
+
+    // 파일 체크
+    if (!req.file) {
+      return res.status(400).json({ error: '이미지 파일이 필요합니다.' });
+    }
+    if (!target_name || !title || !description || !status) {
+      return res.status(400).json({ error: '필수 파라미터가 누락되었습니다.' });
+    }
+
+    // 1) 업로드된 파일 URL 생성
+    const imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+
+    // 2) 외부 임베딩 API 호출
+    try {
+      const form = new FormData();
+      form.append('file', fs.createReadStream(req.file.path));
+      const embedRes = await axios.post(
+        'http://172.20.12.58:80/embedding',
+        form,
+        { headers: form.getHeaders() }
+      );
+
+      const { embedding: rawVec } = embedRes.data;
+      if (!Array.isArray(rawVec) || rawVec.length !== 512) {
+        throw new Error(`임베딩 길이가 ${rawVec?.length}로 올바르지 않습니다.`);
+      }
+      const vecString = `[${rawVec.join(',')}]`;  // pgvector 문자열
+
+      // 3) DB에 INSERT (target_image_url + target_embedding 모두 저장)
+      const client = await pool.connect();
+      const sql = `
+        INSERT INTO contests
+          (target_name, target_image_url, title, description, status, start_date, target_embedding)
+        VALUES
+          ($1, $2, $3, $4, $5, NOW(), $6::vector)
+        RETURNING *`;
+      const vals = [
+        target_name,
+        imageUrl,
+        title,
+        description,
+        status,
+        vecString
+      ];
+      const result = await client.query(sql, vals);
+      client.release();
+
+      return res.json(result.rows[0]);
+    } catch (err) {
+      console.error('POST /contestsadd error:', err);
+      return res.status(500).json({ error: err.message || 'DB 저장 중 오류 발생' });
+    }
+  }
+);
+
 
 app.post('/contest_entry_add', async (req, res) => {
   const {
