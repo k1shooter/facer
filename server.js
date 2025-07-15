@@ -21,32 +21,11 @@ dotenv.config();
 // 3. Express 애플리케이션 초기화
 const app = express(); 
 const port = process.env.PORT || 3000;
-const FLASK_URL = process.env.FLASK_BACKEND_URL
 
 // 4. 미들웨어 설정
 app.use(express.json());                       // JSON 바디 파싱
 app.use(express.urlencoded({ extended: true }));
-// app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
-// app.use(
-//   cors({
-//     origin: 'https://facer-lake.vercel.app',
-//     methods: ['GET', 'POST', 'OPTIONS'],
-//     credentials: true,          // 클라이언트에서 쿠키나 인증 헤더를 함께 보내야 할 경우
-//     allowedHeaders: [            // 허용할 요청 헤더
-//       'Content-Type',
-//       'Authorization',
-//       'X-Requested-With'
-//     ]
-//   })
-// );
-app.use(cors({
-  origin: 'https://facer-lake.vercel.app', // 특정 프론트엔드 도메인만 허용
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'], // 허용할 HTTP 메서드
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'], // 허용할 요청 헤더
-  credentials: true, // 쿠키/인증 헤더를 포함할 경우 true로 설정
-}));
-
-
+app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
 app.use(session({
   secret: process.env.SESSION_SECRET || 'session_secret',
   resave: false,
@@ -287,7 +266,7 @@ app.post('/uploaduser', authenticateToken, upload.single('file'),  async (myreq,
     const form = new FormData();
     form.append('file', fs.createReadStream(myreq.file.path));
 
-    const res = await axios.post(`${FLASK_URL}/embedding`, form, {
+    const res = await axios.post('http://172.20.12.58:80/embedding', form, {
       headers: form.getHeaders(),
     });
 
@@ -327,7 +306,6 @@ app.post('/uploaduser', authenticateToken, upload.single('file'),  async (myreq,
   } catch (err) {
     myres.status(500).json({ error: err.message });
     console.log(err.message);
-    console.log(err.stack);
   } finally {
     if (client) client.release();
   }
@@ -353,7 +331,7 @@ app.post('/uploadtarget', upload.single('file'), async (myreq, myres) => {
     const form = new FormData();
     form.append('file', fs.createReadStream(myreq.file.path));
 
-    const res = await axios.post(`${FLASK_URL}/embedding`, form, {
+    const res = await axios.post('http://172.20.12.58:80/embedding', form, {
       headers: form.getHeaders(),
     });
 
@@ -419,7 +397,7 @@ app.post('/uploadtarget', upload.single('file'), async (myreq, myres) => {
     const form = new FormData();
     form.append('file', fs.createReadStream(myreq.file.path));
 
-    const res = await axios.post(`${FLASK_URL}/embedding`, form, {
+    const res = await axios.post('http://172.20.12.58:80/embedding', form, {
       headers: form.getHeaders(),
     });
 
@@ -503,7 +481,7 @@ app.post(
       // 4) 외부 예측 API ('http://172.20.12.58:80/predict')를 호출합니다.
       // 'form.getHeaders()'는 FormData에 필요한 'Content-Type' 헤더를 자동으로 설정합니다.
       const response = await axios.post(
-        `${FLASK_URL}/predict`, 
+        'http://172.20.12.58:80/predict', 
         form, 
         {
           headers: form.getHeaders(),
@@ -713,7 +691,7 @@ app.post(
       const form = new FormData();
       form.append('file', fs.createReadStream(req.file.path));
       const embedRes = await axios.post(
-        `${FLASK_URL}/embedding`,
+        'http://172.20.12.58:80/embedding',
         form,
         { headers: form.getHeaders() }
       );
