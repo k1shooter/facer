@@ -21,11 +21,21 @@ dotenv.config();
 // 3. Express 애플리케이션 초기화
 const app = express(); 
 const port = process.env.PORT || 3000;
+const FLASK_APP_URL = process.env.FLASK_BACKEND_URL
 
 // 4. 미들웨어 설정
 app.use(express.json());                       // JSON 바디 파싱
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: process.env.FRONTEND_URL, credentials: true }));
+// CORS 미들웨어 설정
+app.use(cors({
+  origin: 'http://localhost:5173', // 허용할 프론트엔드 주소 (마지막 슬래시 없음!)
+  methods: ['GET', 'POST', 'OPTIONS', 'PUT', 'DELETE', 'PATCH'], // 허용할 HTTP 메서드
+  allowedHeaders: ['DNT', 'User-Agent', 'X-Requested-With', 'If-Modified-Since', 'Cache-Control', 'Content-Type', 'Range', 'Authorization'], // 허용할 요청 헤더
+  // 🚨 바로 이 부분입니다!
+  credentials: true, // Access-Control-Allow-Credentials: true 헤더를 응답에 포함
+  maxAge: 1728000 // Preflight 요청 캐싱 시간 (초)
+}));
 app.use(session({
   secret: process.env.SESSION_SECRET || 'session_secret',
   resave: false,
@@ -103,6 +113,7 @@ app.post('/auth/google/login', async (req, res) => {
   if (!code) return res.status(400).json({ message: '인가 코드가 필요합니다.' });
   try {
     // 1) 구글 토큰 교환
+    console.log('before POST request to /auth/google/login');
     const tokenRes = await axios.post(
       GOOGLE_TOKEN_URI,
       qs.stringify({
@@ -115,6 +126,7 @@ app.post('/auth/google/login', async (req, res) => {
       { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
     );
     const { id_token } = tokenRes.data;
+    console.log('Received POST request to /auth/google/login');
 
     // 2) ID 토큰 디코딩
     const decoded = jwt.decode(id_token);
@@ -125,13 +137,14 @@ app.post('/auth/google/login', async (req, res) => {
 
     // 3) 사용자 저장 또는 업데이트
     const user = await findOrCreateUser(googleId, nickname, email, picture);
+    console.log('Find POST request to /auth/google/login');
 
     // 4) JWT 발급
     const appToken = generateJwtToken(user.user_id, googleId, nickname);
     res.json({ token: appToken, user });
   } catch (err) {
     console.error('구글 로그인 오류:', err.response?.data || err.message);
-    res.status(500).json({ message: '구글 로그인 처리 중 오류가 발생했습니다.' });
+    res.status(500).json({ message: '구글 로그인 처리 중 오류가 발생했습니다.', detail: err.message });
   }
 });
 
@@ -248,6 +261,8 @@ app.post('/uploaduser', authenticateToken, upload.single('file'),  async (myreq,
   let client;
   try {
     client = await pool.connect();
+    console.log('2. PostgreSQL DB 연결 성공.'); // DB 연결 확인
+
 
     // let meta;
     // if (myreq.body.meta) {
@@ -262,13 +277,16 @@ app.post('/uploaduser', authenticateToken, upload.single('file'),  async (myreq,
     //     return myres.status(400).json({ error: "meta 데이터가 누락되었습니다." });
     // }
     const userId = myreq.user.id;
+    console.log(`3. 사용자 ID: ${userId}, 업로드된 파일 경로: ${myreq.file.path}`);
 
     const form = new FormData();
     form.append('file', fs.createReadStream(myreq.file.path));
+    console.log('4. Flask로 보낼 FormData 생성 완료.'); // FormData 생성 확인
 
-    const res = await axios.post('http://172.20.12.58:80/embedding', form, {
+    const res = await axios.post(`${FLASK_APP_URL}/embedding`, form, {
       headers: form.getHeaders(),
     });
+    console.log('6. Flask 백엔드로부터 응답 성공.'); // Flask 응답 성공 확인
 
     const { embedding: embeddingVectorRaw, facial_area: facialArea, facial_confidence: facialConfidence } = res.data;
     let embeddingVectorString; // 변환된 벡터 문자열을 저장할 변수
@@ -286,6 +304,7 @@ app.post('/uploaduser', authenticateToken, upload.single('file'),  async (myreq,
         'INSERT INTO user_photos (user_id, image_url, embedding_vector, uploaded_at) VALUES ($1, $2, $3, NOW()) RETURNING user_photo_id, image_url, uploaded_at',
         [userId, myreq.file.path, embeddingVectorString] // 👈 변환된 embeddingVectorString과 얼굴 정보 사용
     );
+    console.log('6. DB.');
     const newPhoto = insertResult.rows[0];
     const userPhotoId = newPhoto.user_photo_id;
 
@@ -331,7 +350,7 @@ app.post('/uploadtarget', upload.single('file'), async (myreq, myres) => {
     const form = new FormData();
     form.append('file', fs.createReadStream(myreq.file.path));
 
-    const res = await axios.post('http://172.20.12.58:80/embedding', form, {
+    const res = await axios.post(`${FLASK_APP_URL}/embedding`, form, {
       headers: form.getHeaders(),
     });
 
@@ -397,7 +416,7 @@ app.post('/uploadtarget', upload.single('file'), async (myreq, myres) => {
     const form = new FormData();
     form.append('file', fs.createReadStream(myreq.file.path));
 
-    const res = await axios.post('http://172.20.12.58:80/embedding', form, {
+    const res = await axios.post(`${FLASK_APP_URL}/embedding`, form, {
       headers: form.getHeaders(),
     });
 
@@ -477,11 +496,12 @@ app.post(
       // 2. FormData 생성 및 API 요청
       const form = new FormData();
       form.append('file', fs.createReadStream(croppedPath));
+      console.log("getsimilar from");
 
       // 4) 외부 예측 API ('http://172.20.12.58:80/predict')를 호출합니다.
       // 'form.getHeaders()'는 FormData에 필요한 'Content-Type' 헤더를 자동으로 설정합니다.
       const response = await axios.post(
-        'http://172.20.12.58:80/predict', 
+        `${FLASK_APP_URL}/predict`, 
         form, 
         {
           headers: form.getHeaders(),
@@ -501,6 +521,7 @@ app.post(
     } catch (err) {
       // 에러 발생 시 콘솔에 로깅하고 클라이언트에 에러 응답을 보냅니다.
       console.error('getsimilaranimal error:', err.message);
+      console.error('Axios error stack trace:', err.stack);
       // Axios 에러인 경우 (예: 외부 API 연결 실패) 더 자세한 정보를 로깅합니다.
       if (axios.isAxiosError(err)) {
         console.error('Axios error details:', err.response?.data || err.message);
@@ -691,7 +712,7 @@ app.post(
       const form = new FormData();
       form.append('file', fs.createReadStream(req.file.path));
       const embedRes = await axios.post(
-        'http://172.20.12.58:80/embedding',
+        `${FLASK_APP_URL}/embedding`,
         form,
         { headers: form.getHeaders() }
       );
